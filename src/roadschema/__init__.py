@@ -1,2 +1,1 @@
-"""RoadSchema - Schema Validation for BlackRoad."""
-from .schema import *
+"""roadschema - BlackRoad OS"""

@@ -1,559 +1,317 @@
 """
 RoadSchema - Schema Validation for BlackRoad
-JSON Schema validation, type coercion, and data normalization.
+Validate data against schemas with rich error messages.
 """
 
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional, Set, Type, Union
-import json
-import logging
+from typing import Any, Callable, Dict, List, Optional, Type, Union
 import re
-import threading
-import uuid
+import logging
 
 logger = logging.getLogger(__name__)
 
 
-class SchemaType(str, Enum):
-    """Schema types."""
-    STRING = "string"
-    INTEGER = "integer"
-    NUMBER = "number"
-    BOOLEAN = "boolean"
-    ARRAY = "array"
-    OBJECT = "object"
-    NULL = "null"
-    ANY = "any"
-
-
-class ValidationError:
-    """Validation error."""
-
-    def __init__(self, path: str, message: str, value: Any = None):
-        self.path = path
+class SchemaError(Exception):
+    def __init__(self, message: str, path: str = "", value: Any = None):
         self.message = message
+        self.path = path
         self.value = value
+        super().__init__(f"{path}: {message}" if path else message)
 
-    def __str__(self):
-        return f"{self.path}: {self.message}"
 
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "path": self.path,
-            "message": self.message,
-            "value": self.value
-        }
+@dataclass
+class ValidationError:
+    path: str
+    message: str
+    value: Any = None
 
 
 @dataclass
 class ValidationResult:
-    """Validation result."""
     valid: bool
     errors: List[ValidationError] = field(default_factory=list)
-    value: Any = None  # Coerced/normalized value
-
-    def add_error(self, path: str, message: str, value: Any = None) -> None:
-        self.errors.append(ValidationError(path, message, value))
-        self.valid = False
+    data: Any = None
 
 
-class SchemaField:
-    """A schema field definition."""
+class Schema:
+    def validate(self, value: Any, path: str = "") -> ValidationResult:
+        raise NotImplementedError
 
-    def __init__(
-        self,
-        field_type: SchemaType,
-        required: bool = False,
-        default: Any = None,
-        nullable: bool = False,
-        validators: List[Callable[[Any], bool]] = None,
-        coerce: bool = False,
-        **constraints
-    ):
-        self.field_type = field_type
-        self.required = required
-        self.default = default
-        self.nullable = nullable
-        self.validators = validators or []
-        self.coerce = coerce
-        self.constraints = constraints
+
+class StringSchema(Schema):
+    def __init__(self, min_length: int = None, max_length: int = None, pattern: str = None, enum: List[str] = None):
+        self.min_length = min_length
+        self.max_length = max_length
+        self.pattern = re.compile(pattern) if pattern else None
+        self.enum = enum
 
     def validate(self, value: Any, path: str = "") -> ValidationResult:
-        """Validate a value against this field."""
-        result = ValidationResult(valid=True)
-
-        # Handle None
-        if value is None:
-            if self.nullable:
-                result.value = None
-                return result
-            elif self.required:
-                result.add_error(path, "Required field is null")
-                return result
-            elif self.default is not None:
-                result.value = self.default
-                return result
-
-        # Type coercion
-        if self.coerce:
-            value = self._coerce(value)
-
-        # Type validation
-        if not self._check_type(value):
-            result.add_error(
-                path,
-                f"Expected {self.field_type.value}, got {type(value).__name__}",
-                value
-            )
-            return result
-
-        # Constraint validation
-        constraint_errors = self._check_constraints(value, path)
-        for error in constraint_errors:
-            result.add_error(error.path, error.message, error.value)
-
-        # Custom validators
-        for validator in self.validators:
-            try:
-                if not validator(value):
-                    result.add_error(path, "Custom validation failed", value)
-            except Exception as e:
-                result.add_error(path, f"Validator error: {e}", value)
-
-        if result.valid:
-            result.value = value
-
-        return result
-
-    def _coerce(self, value: Any) -> Any:
-        """Coerce value to target type."""
-        if value is None:
-            return None
-
-        try:
-            if self.field_type == SchemaType.STRING:
-                return str(value)
-            elif self.field_type == SchemaType.INTEGER:
-                return int(value)
-            elif self.field_type == SchemaType.NUMBER:
-                return float(value)
-            elif self.field_type == SchemaType.BOOLEAN:
-                if isinstance(value, str):
-                    return value.lower() in ('true', '1', 'yes')
-                return bool(value)
-        except (ValueError, TypeError):
-            pass
-
-        return value
-
-    def _check_type(self, value: Any) -> bool:
-        """Check if value matches type."""
-        type_map = {
-            SchemaType.STRING: str,
-            SchemaType.INTEGER: int,
-            SchemaType.NUMBER: (int, float),
-            SchemaType.BOOLEAN: bool,
-            SchemaType.ARRAY: list,
-            SchemaType.OBJECT: dict,
-            SchemaType.NULL: type(None),
-            SchemaType.ANY: object
-        }
-
-        expected = type_map.get(self.field_type)
-        if expected:
-            return isinstance(value, expected)
-        return True
-
-    def _check_constraints(self, value: Any, path: str) -> List[ValidationError]:
-        """Check constraints."""
         errors = []
-
-        # String constraints
-        if self.field_type == SchemaType.STRING:
-            if "min_length" in self.constraints:
-                if len(value) < self.constraints["min_length"]:
-                    errors.append(ValidationError(path, f"Min length is {self.constraints['min_length']}"))
-            if "max_length" in self.constraints:
-                if len(value) > self.constraints["max_length"]:
-                    errors.append(ValidationError(path, f"Max length is {self.constraints['max_length']}"))
-            if "pattern" in self.constraints:
-                if not re.match(self.constraints["pattern"], value):
-                    errors.append(ValidationError(path, f"Does not match pattern"))
-            if "enum" in self.constraints:
-                if value not in self.constraints["enum"]:
-                    errors.append(ValidationError(path, f"Must be one of: {self.constraints['enum']}"))
-
-        # Number constraints
-        elif self.field_type in (SchemaType.INTEGER, SchemaType.NUMBER):
-            if "minimum" in self.constraints:
-                if value < self.constraints["minimum"]:
-                    errors.append(ValidationError(path, f"Minimum is {self.constraints['minimum']}"))
-            if "maximum" in self.constraints:
-                if value > self.constraints["maximum"]:
-                    errors.append(ValidationError(path, f"Maximum is {self.constraints['maximum']}"))
-
-        # Array constraints
-        elif self.field_type == SchemaType.ARRAY:
-            if "min_items" in self.constraints:
-                if len(value) < self.constraints["min_items"]:
-                    errors.append(ValidationError(path, f"Min items is {self.constraints['min_items']}"))
-            if "max_items" in self.constraints:
-                if len(value) > self.constraints["max_items"]:
-                    errors.append(ValidationError(path, f"Max items is {self.constraints['max_items']}"))
-            if "unique_items" in self.constraints and self.constraints["unique_items"]:
-                # Check for duplicates
-                try:
-                    if len(value) != len(set(map(str, value))):
-                        errors.append(ValidationError(path, "Array must have unique items"))
-                except TypeError:
-                    pass
-
-        return errors
+        if not isinstance(value, str):
+            errors.append(ValidationError(path, f"Expected string, got {type(value).__name__}", value))
+            return ValidationResult(valid=False, errors=errors)
+        
+        if self.min_length and len(value) < self.min_length:
+            errors.append(ValidationError(path, f"String too short (min {self.min_length})", value))
+        if self.max_length and len(value) > self.max_length:
+            errors.append(ValidationError(path, f"String too long (max {self.max_length})", value))
+        if self.pattern and not self.pattern.match(value):
+            errors.append(ValidationError(path, f"String doesn't match pattern", value))
+        if self.enum and value not in self.enum:
+            errors.append(ValidationError(path, f"Value not in {self.enum}", value))
+        
+        return ValidationResult(valid=len(errors) == 0, errors=errors, data=value)
 
 
-class ObjectSchema:
-    """Object schema definition."""
+class NumberSchema(Schema):
+    def __init__(self, minimum: float = None, maximum: float = None, exclusive_min: float = None, exclusive_max: float = None, multiple_of: float = None, integer: bool = False):
+        self.minimum = minimum
+        self.maximum = maximum
+        self.exclusive_min = exclusive_min
+        self.exclusive_max = exclusive_max
+        self.multiple_of = multiple_of
+        self.integer = integer
 
-    def __init__(
-        self,
-        fields: Dict[str, SchemaField] = None,
-        additional_properties: bool = True,
-        strict: bool = False
-    ):
-        self.fields = fields or {}
-        self.additional_properties = additional_properties
-        self.strict = strict
-
-    def add_field(self, name: str, field: SchemaField) -> "ObjectSchema":
-        """Add a field to the schema."""
-        self.fields[name] = field
-        return self
-
-    def validate(self, data: Dict[str, Any], path: str = "") -> ValidationResult:
-        """Validate data against schema."""
-        result = ValidationResult(valid=True, value={})
-
-        if not isinstance(data, dict):
-            result.add_error(path, "Expected object", data)
-            return result
-
-        # Validate each defined field
-        for name, field in self.fields.items():
-            field_path = f"{path}.{name}" if path else name
-            value = data.get(name)
-
-            if value is None and name not in data:
-                if field.required:
-                    result.add_error(field_path, "Required field is missing")
-                elif field.default is not None:
-                    result.value[name] = field.default
-                continue
-
-            field_result = field.validate(value, field_path)
-
-            if not field_result.valid:
-                for error in field_result.errors:
-                    result.add_error(error.path, error.message, error.value)
-            else:
-                result.value[name] = field_result.value
-
-        # Check additional properties
-        if not self.additional_properties:
-            extra_keys = set(data.keys()) - set(self.fields.keys())
-            if extra_keys:
-                result.add_error(path, f"Additional properties not allowed: {extra_keys}")
-        elif not self.strict:
-            # Include additional properties
-            for key in data.keys():
-                if key not in self.fields:
-                    result.value[key] = data[key]
-
-        return result
+    def validate(self, value: Any, path: str = "") -> ValidationResult:
+        errors = []
+        if self.integer and not isinstance(value, int):
+            errors.append(ValidationError(path, "Expected integer", value))
+            return ValidationResult(valid=False, errors=errors)
+        if not isinstance(value, (int, float)):
+            errors.append(ValidationError(path, f"Expected number, got {type(value).__name__}", value))
+            return ValidationResult(valid=False, errors=errors)
+        
+        if self.minimum is not None and value < self.minimum:
+            errors.append(ValidationError(path, f"Value below minimum {self.minimum}", value))
+        if self.maximum is not None and value > self.maximum:
+            errors.append(ValidationError(path, f"Value above maximum {self.maximum}", value))
+        if self.exclusive_min is not None and value <= self.exclusive_min:
+            errors.append(ValidationError(path, f"Value must be > {self.exclusive_min}", value))
+        if self.exclusive_max is not None and value >= self.exclusive_max:
+            errors.append(ValidationError(path, f"Value must be < {self.exclusive_max}", value))
+        if self.multiple_of and value % self.multiple_of != 0:
+            errors.append(ValidationError(path, f"Value must be multiple of {self.multiple_of}", value))
+        
+        return ValidationResult(valid=len(errors) == 0, errors=errors, data=value)
 
 
-class ArraySchema:
-    """Array schema definition."""
+class BooleanSchema(Schema):
+    def validate(self, value: Any, path: str = "") -> ValidationResult:
+        if not isinstance(value, bool):
+            return ValidationResult(valid=False, errors=[ValidationError(path, f"Expected boolean, got {type(value).__name__}", value)])
+        return ValidationResult(valid=True, data=value)
 
-    def __init__(
-        self,
-        items: Union[SchemaField, ObjectSchema] = None,
-        min_items: int = None,
-        max_items: int = None,
-        unique_items: bool = False
-    ):
+
+class ArraySchema(Schema):
+    def __init__(self, items: Schema = None, min_items: int = None, max_items: int = None, unique: bool = False):
         self.items = items
         self.min_items = min_items
         self.max_items = max_items
-        self.unique_items = unique_items
+        self.unique = unique
 
-    def validate(self, data: List[Any], path: str = "") -> ValidationResult:
-        """Validate array against schema."""
-        result = ValidationResult(valid=True, value=[])
-
-        if not isinstance(data, list):
-            result.add_error(path, "Expected array", data)
-            return result
-
-        # Length constraints
-        if self.min_items is not None and len(data) < self.min_items:
-            result.add_error(path, f"Array must have at least {self.min_items} items")
-
-        if self.max_items is not None and len(data) > self.max_items:
-            result.add_error(path, f"Array must have at most {self.max_items} items")
-
-        # Validate items
+    def validate(self, value: Any, path: str = "") -> ValidationResult:
+        errors = []
+        if not isinstance(value, list):
+            errors.append(ValidationError(path, f"Expected array, got {type(value).__name__}", value))
+            return ValidationResult(valid=False, errors=errors)
+        
+        if self.min_items and len(value) < self.min_items:
+            errors.append(ValidationError(path, f"Array too short (min {self.min_items})", value))
+        if self.max_items and len(value) > self.max_items:
+            errors.append(ValidationError(path, f"Array too long (max {self.max_items})", value))
+        if self.unique and len(value) != len(set(str(v) for v in value)):
+            errors.append(ValidationError(path, "Array items must be unique", value))
+        
+        validated = []
         if self.items:
-            for i, item in enumerate(data):
-                item_path = f"{path}[{i}]"
-
-                if isinstance(self.items, ObjectSchema):
-                    item_result = self.items.validate(item, item_path)
-                else:
-                    item_result = self.items.validate(item, item_path)
-
-                if not item_result.valid:
-                    for error in item_result.errors:
-                        result.add_error(error.path, error.message, error.value)
-                else:
-                    result.value.append(item_result.value)
+            for i, item in enumerate(value):
+                result = self.items.validate(item, f"{path}[{i}]")
+                errors.extend(result.errors)
+                validated.append(result.data)
         else:
-            result.value = data.copy()
-
-        # Unique items
-        if self.unique_items:
-            try:
-                seen = set()
-                for item in data:
-                    key = json.dumps(item, sort_keys=True)
-                    if key in seen:
-                        result.add_error(path, "Array must have unique items")
-                        break
-                    seen.add(key)
-            except TypeError:
-                pass
-
-        return result
+            validated = value
+        
+        return ValidationResult(valid=len(errors) == 0, errors=errors, data=validated)
 
 
-class SchemaBuilder:
-    """Fluent schema builder."""
+class ObjectSchema(Schema):
+    def __init__(self, properties: Dict[str, Schema] = None, required: List[str] = None, additional: bool = True):
+        self.properties = properties or {}
+        self.required = required or []
+        self.additional = additional
 
-    @staticmethod
-    def string(
-        required: bool = False,
-        min_length: int = None,
-        max_length: int = None,
-        pattern: str = None,
-        enum: List[str] = None,
-        **kwargs
-    ) -> SchemaField:
-        constraints = {}
-        if min_length: constraints["min_length"] = min_length
-        if max_length: constraints["max_length"] = max_length
-        if pattern: constraints["pattern"] = pattern
-        if enum: constraints["enum"] = enum
-        return SchemaField(SchemaType.STRING, required=required, **constraints, **kwargs)
+    def validate(self, value: Any, path: str = "") -> ValidationResult:
+        errors = []
+        if not isinstance(value, dict):
+            errors.append(ValidationError(path, f"Expected object, got {type(value).__name__}", value))
+            return ValidationResult(valid=False, errors=errors)
+        
+        for req in self.required:
+            if req not in value:
+                errors.append(ValidationError(f"{path}.{req}" if path else req, "Required field missing", None))
+        
+        validated = {}
+        for key, schema in self.properties.items():
+            if key in value:
+                prop_path = f"{path}.{key}" if path else key
+                result = schema.validate(value[key], prop_path)
+                errors.extend(result.errors)
+                validated[key] = result.data
+        
+        if self.additional:
+            for key in value:
+                if key not in self.properties:
+                    validated[key] = value[key]
+        elif not self.additional:
+            for key in value:
+                if key not in self.properties:
+                    errors.append(ValidationError(f"{path}.{key}" if path else key, "Additional property not allowed", value[key]))
+        
+        return ValidationResult(valid=len(errors) == 0, errors=errors, data=validated)
 
-    @staticmethod
-    def integer(
-        required: bool = False,
-        minimum: int = None,
-        maximum: int = None,
-        **kwargs
-    ) -> SchemaField:
-        constraints = {}
-        if minimum is not None: constraints["minimum"] = minimum
-        if maximum is not None: constraints["maximum"] = maximum
-        return SchemaField(SchemaType.INTEGER, required=required, **constraints, **kwargs)
 
-    @staticmethod
-    def number(
-        required: bool = False,
-        minimum: float = None,
-        maximum: float = None,
-        **kwargs
-    ) -> SchemaField:
-        constraints = {}
-        if minimum is not None: constraints["minimum"] = minimum
-        if maximum is not None: constraints["maximum"] = maximum
-        return SchemaField(SchemaType.NUMBER, required=required, **constraints, **kwargs)
+class UnionSchema(Schema):
+    def __init__(self, schemas: List[Schema]):
+        self.schemas = schemas
 
-    @staticmethod
-    def boolean(required: bool = False, **kwargs) -> SchemaField:
-        return SchemaField(SchemaType.BOOLEAN, required=required, **kwargs)
+    def validate(self, value: Any, path: str = "") -> ValidationResult:
+        for schema in self.schemas:
+            result = schema.validate(value, path)
+            if result.valid:
+                return result
+        return ValidationResult(valid=False, errors=[ValidationError(path, "Value doesn't match any schema", value)])
 
-    @staticmethod
-    def array(
-        items: Union[SchemaField, ObjectSchema] = None,
-        min_items: int = None,
-        max_items: int = None,
-        unique: bool = False
-    ) -> ArraySchema:
-        return ArraySchema(items, min_items, max_items, unique)
 
-    @staticmethod
-    def object(
-        fields: Dict[str, SchemaField] = None,
-        additional: bool = True
-    ) -> ObjectSchema:
-        return ObjectSchema(fields, additional)
+class NullableSchema(Schema):
+    def __init__(self, schema: Schema):
+        self.schema = schema
+
+    def validate(self, value: Any, path: str = "") -> ValidationResult:
+        if value is None:
+            return ValidationResult(valid=True, data=None)
+        return self.schema.validate(value, path)
+
+
+class RefSchema(Schema):
+    def __init__(self, ref: str, registry: "SchemaRegistry"):
+        self.ref = ref
+        self.registry = registry
+
+    def validate(self, value: Any, path: str = "") -> ValidationResult:
+        schema = self.registry.get(self.ref)
+        if not schema:
+            return ValidationResult(valid=False, errors=[ValidationError(path, f"Unknown schema ref: {self.ref}", value)])
+        return schema.validate(value, path)
+
+
+class CustomSchema(Schema):
+    def __init__(self, validator: Callable[[Any], bool], message: str = "Validation failed"):
+        self.validator = validator
+        self.message = message
+
+    def validate(self, value: Any, path: str = "") -> ValidationResult:
+        if self.validator(value):
+            return ValidationResult(valid=True, data=value)
+        return ValidationResult(valid=False, errors=[ValidationError(path, self.message, value)])
 
 
 class SchemaRegistry:
-    """Registry for reusable schemas."""
-
     def __init__(self):
-        self.schemas: Dict[str, ObjectSchema] = {}
-        self._lock = threading.Lock()
+        self.schemas: Dict[str, Schema] = {}
 
-    def register(self, name: str, schema: ObjectSchema) -> None:
-        """Register a schema."""
-        with self._lock:
-            self.schemas[name] = schema
+    def register(self, name: str, schema: Schema) -> None:
+        self.schemas[name] = schema
 
-    def get(self, name: str) -> Optional[ObjectSchema]:
-        """Get a schema by name."""
+    def get(self, name: str) -> Optional[Schema]:
         return self.schemas.get(name)
 
-    def unregister(self, name: str) -> bool:
-        """Unregister a schema."""
-        with self._lock:
-            if name in self.schemas:
-                del self.schemas[name]
-                return True
-            return False
-
-    def validate(self, name: str, data: Dict[str, Any]) -> ValidationResult:
-        """Validate data against a named schema."""
-        schema = self.get(name)
-        if not schema:
-            result = ValidationResult(valid=False)
-            result.add_error("", f"Schema '{name}' not found")
-            return result
-        return schema.validate(data)
+    def ref(self, name: str) -> RefSchema:
+        return RefSchema(name, self)
 
 
-class SchemaManager:
-    """High-level schema management."""
+class SchemaBuilder:
+    def __init__(self, registry: SchemaRegistry = None):
+        self.registry = registry or SchemaRegistry()
 
-    def __init__(self):
-        self.registry = SchemaRegistry()
-        self.builder = SchemaBuilder()
+    def string(self, **kwargs) -> StringSchema:
+        return StringSchema(**kwargs)
 
-    def define(
-        self,
-        name: str,
-        fields: Dict[str, SchemaField],
-        additional_properties: bool = True
-    ) -> ObjectSchema:
-        """Define and register a schema."""
-        schema = ObjectSchema(fields, additional_properties)
-        self.registry.register(name, schema)
-        return schema
+    def number(self, **kwargs) -> NumberSchema:
+        return NumberSchema(**kwargs)
 
-    def validate(
-        self,
-        data: Dict[str, Any],
-        schema: Union[str, ObjectSchema]
-    ) -> ValidationResult:
-        """Validate data."""
-        if isinstance(schema, str):
-            return self.registry.validate(schema, data)
-        return schema.validate(data)
+    def integer(self, **kwargs) -> NumberSchema:
+        return NumberSchema(integer=True, **kwargs)
 
-    def is_valid(
-        self,
-        data: Dict[str, Any],
-        schema: Union[str, ObjectSchema]
-    ) -> bool:
-        """Check if data is valid."""
-        return self.validate(data, schema).valid
+    def boolean(self) -> BooleanSchema:
+        return BooleanSchema()
 
-    def get_errors(
-        self,
-        data: Dict[str, Any],
-        schema: Union[str, ObjectSchema]
-    ) -> List[Dict[str, Any]]:
-        """Get validation errors."""
-        result = self.validate(data, schema)
-        return [e.to_dict() for e in result.errors]
+    def array(self, items: Schema = None, **kwargs) -> ArraySchema:
+        return ArraySchema(items=items, **kwargs)
+
+    def object(self, properties: Dict[str, Schema] = None, **kwargs) -> ObjectSchema:
+        return ObjectSchema(properties=properties, **kwargs)
+
+    def union(self, *schemas: Schema) -> UnionSchema:
+        return UnionSchema(list(schemas))
+
+    def nullable(self, schema: Schema) -> NullableSchema:
+        return NullableSchema(schema)
+
+    def custom(self, validator: Callable, message: str = "Validation failed") -> CustomSchema:
+        return CustomSchema(validator, message)
+
+    def email(self) -> StringSchema:
+        return StringSchema(pattern=r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$')
+
+    def url(self) -> StringSchema:
+        return StringSchema(pattern=r'^https?://[^\s/$.?#].[^\s]*$')
+
+    def uuid(self) -> StringSchema:
+        return StringSchema(pattern=r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$')
 
 
-# Common validators
-def email_validator(value: str) -> bool:
-    """Validate email format."""
-    return bool(re.match(r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$', value))
+def validate(value: Any, schema: Schema) -> ValidationResult:
+    return schema.validate(value)
 
 
-def url_validator(value: str) -> bool:
-    """Validate URL format."""
-    return bool(re.match(r'^https?://[^\s/$.?#].[^\s]*$', value))
-
-
-def uuid_validator(value: str) -> bool:
-    """Validate UUID format."""
-    try:
-        uuid.UUID(value)
-        return True
-    except ValueError:
-        return False
-
-
-# Example usage
 def example_usage():
-    """Example schema validation usage."""
-    manager = SchemaManager()
-
-    # Define a user schema
-    user_schema = manager.define(
-        "user",
-        {
-            "id": SchemaBuilder.string(required=True, validators=[uuid_validator]),
-            "email": SchemaBuilder.string(required=True, validators=[email_validator]),
-            "name": SchemaBuilder.string(required=True, min_length=1, max_length=100),
-            "age": SchemaBuilder.integer(minimum=0, maximum=150),
-            "role": SchemaBuilder.string(enum=["admin", "user", "guest"], default="user"),
-            "active": SchemaBuilder.boolean(default=True)
+    s = SchemaBuilder()
+    
+    user_schema = s.object(
+        properties={
+            "id": s.integer(minimum=1),
+            "name": s.string(min_length=2, max_length=100),
+            "email": s.email(),
+            "age": s.nullable(s.integer(minimum=0, maximum=150)),
+            "role": s.string(enum=["admin", "user", "guest"]),
+            "tags": s.array(items=s.string(), unique=True),
         },
-        additional_properties=False
+        required=["id", "name", "email", "role"]
     )
-
-    # Valid data
-    valid_data = {
-        "id": str(uuid.uuid4()),
-        "email": "user@example.com",
-        "name": "John Doe",
+    
+    valid_user = {
+        "id": 1,
+        "name": "Alice",
+        "email": "alice@example.com",
         "age": 30,
-        "role": "admin"
+        "role": "admin",
+        "tags": ["developer", "manager"]
     }
-
-    result = manager.validate(valid_data, "user")
+    
+    result = validate(valid_user, user_schema)
     print(f"Valid: {result.valid}")
-    print(f"Value: {result.value}")
-
-    # Invalid data
-    invalid_data = {
-        "id": "not-a-uuid",
+    
+    invalid_user = {
+        "id": "not-a-number",
+        "name": "A",
         "email": "invalid-email",
-        "name": "",
-        "age": 200
+        "role": "superuser",
     }
-
-    result = manager.validate(invalid_data, "user")
-    print(f"\nInvalid: {result.valid}")
+    
+    result = validate(invalid_user, user_schema)
+    print(f"Valid: {result.valid}")
     for error in result.errors:
-        print(f"  - {error}")
-
-    # Array schema
-    tags_schema = SchemaBuilder.array(
-        items=SchemaBuilder.string(min_length=1),
-        min_items=1,
-        max_items=5,
-        unique=True
-    )
-
-    tags_result = tags_schema.validate(["python", "javascript", "python"])
-    print(f"\nTags valid: {tags_result.valid}")
+        print(f"  {error.path}: {error.message}")
 
